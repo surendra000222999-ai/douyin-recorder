@@ -1,0 +1,50 @@
+name: Douyin Auto-Recorder to GitHub Release
+
+on:
+  schedule:
+    # Runs daily at 12:00 UTC (Adjust this to match when the creator streams)
+    - cron: '0 12 * * *' 
+  workflow_dispatch: # Adds a button so you can trigger it manually
+
+jobs:
+  record-and-upload:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Clone DouyinLiveRecorder
+        run: |
+          git clone https://github.com/ihmily/DouyinLiveRecorder.git
+          cd DouyinLiveRecorder
+          pip install -r requirements.txt
+
+      - name: Configure Target Profile
+        run: |
+          mkdir -p DouyinLiveRecorder/config
+          echo "https://v.douyin.com/S3kbyShfnuc/" > DouyinLiveRecorder/config/URL_config.ini
+
+      - name: Record Stream (Max 4 Hours)
+        run: |
+          cd DouyinLiveRecorder
+          # Stops recording at 4 hours so the file stays under GitHub's 2GB limit
+          timeout 240m python3 main.py || true
+          
+      - name: Get current date and time
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d_%H-%M')" >> $GITHUB_ENV
+          
+      - name: Upload Video to GitHub Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: "Stream_${{ env.date }}"
+          name: "Live Stream - ${{ env.date }}"
+          files: DouyinLiveRecorder/downloads/**/*.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
