@@ -1,50 +1,132 @@
-name: Douyin Auto-Recorder to GitHub Release
-
+name: Pro Douyin Auto-Recorder
 on:
   schedule:
-    # Runs daily at 12:00 UTC (Adjust this to match when the creator streams)
-    - cron: '0 12 * * *' 
-  workflow_dispatch: # Adds a button so you can trigger it manually
+    - cron: '*/5 * * * *'   # every 5 min — the shortest interval GitHub Actions honors
+  workflow_dispatch:
+
+# FIX #1: GITHUB_TOKEN defaults to read-only in most repos now.
+# Without this block, action-gh-release fails with a 403.
+permissions:
+  contents: write
+
+# Prevent overlapping runs now that the cron fires every 5 min.
+concurrency:
+  group: douyin-recorder
+  cancel-in-progress: false
 
 jobs:
   record-and-upload:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 150   # job-level safety net above the 120m recorder timeout
+
     steps:
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Clone DouyinLiveRecorder
         run: |
-          git clone https://github.com/ihmily/DouyinLiveRecorder.git
+          git clone --depth 1 https://github.com/ihmily/DouyinLiveRecorder.git
           cd DouyinLiveRecorder
           pip install -r requirements.txt
 
-      - name: Configure Target Profile
+      - name: Configure Target Profiles
         run: |
           mkdir -p DouyinLiveRecorder/config
-          echo "https://v.douyin.com/S3kbyShfnuc/" > DouyinLiveRecorder/config/URL_config.ini
+          # Add each account's real live-room URL on its own line below.
+          # No placeholder text — every line here becomes a live monitor
+          # thread, so a fake line = a broken thread spamming errors.
+          cat << 'EOF' > DouyinLiveRecorder/config/URL_config.ini
+          https://v.douyin.com/HB7rXoPs2A0/
+          https://v.douyin.com/pfyQWJgcsyw/
+          https://v.douyin.com/acmh2dsAKi8/
+          https://v.douyin.com/7WRqRjeOXkg/
+          EOF
 
-      - name: Record Stream (Max 4 Hours)
+      - name: Pro Smart Recorder (Auto-Stop & No Empty Waits)
         run: |
           cd DouyinLiveRecorder
-          # Stops recording at 4 hours so the file stays under GitHub's 2GB limit
-          timeout 240m python3 main.py || true
-          
+
+          # FIX #2: run in its own process group so we can signal the whole
+          # tree (python3 + any ffmpeg children), not just the `timeout` wrapper.
+          setsid timeout 120m python3 main.py &
+          REC_PID=$!
+
+          echo "Checking if any configured creators are live..."
+
+          WAIT_LOOPS=0
+          STREAM_STARTED=false
+          while [ $WAIT_LOOPS -lt 3 ]; do
+            if [ -d "downloads" ]; then
+              VIDEO_COUNT=$(find downloads -type f \( -name "*.mp4" -o -name "*.ts" -o -name "*.flv" \) 2>/dev/null | wc -l)
+              if [ "$VIDEO_COUNT" -gt 0 ]; then
+                STREAM_STARTED=true
+                break
+              fi
+            fi
+            sleep 60
+            WAIT_LOOPS=$((WAIT_LOOPS+1))
+          done
+
+          if [ "$STREAM_STARTED" = false ]; then
+            echo "All creators are offline. Stopping workflow to prevent empty releases."
+            kill -TERM -- -$REC_PID 2>/dev/null || true
+            exit 0
+          fi
+
+          echo "Live stream detected! Recording in progress..."
+
+          # FIX #5: track size PER creator subfolder, not the aggregate total,
+          # so one still-live stream can't mask another that already stalled.
+          declare -A PREV_SIZE
+          declare -A STALLED_MINS
+
+          while kill -0 "$REC_PID" 2>/dev/null; do
+            sleep 60
+            ALL_STALLED=true
+            for dir in downloads/*/; do
+              [ -d "$dir" ] || continue
+              CUR=$(du -sb "$dir" | cut -f1)
+              PREV=${PREV_SIZE[$dir]:-0}
+              if [ "$CUR" -eq "$PREV" ]; then
+                STALLED_MINS[$dir]=$(( ${STALLED_MINS[$dir]:-0} + 1 ))
+              else
+                STALLED_MINS[$dir]=0
+              fi
+              PREV_SIZE[$dir]=$CUR
+              if [ "${STALLED_MINS[$dir]}" -lt 4 ]; then
+                ALL_STALLED=false
+              fi
+            done
+
+            if [ "$ALL_STALLED" = true ]; then
+              echo "All active streams have ended (no new data for 4 mins). Saving video..."
+              # FIX #2 continued: SIGINT first — the tool's own clean-stop signal —
+              # give it time to flush/finalize, then hard-kill if it ignores that.
+              kill -INT -- -$REC_PID 2>/dev/null || true
+              for i in $(seq 1 15); do
+                kill -0 "$REC_PID" 2>/dev/null || break
+                sleep 1
+              done
+              kill -KILL -- -$REC_PID 2>/dev/null || true
+              break
+            fi
+          done
+
       - name: Get current date and time
         id: date
-        run: echo "date=$(date +'%Y-%m-%d_%H-%M')" >> $GITHUB_ENV
-          
+        run: echo "date=$(date +'%Y-%m-%d_%H-%M')" >> "$GITHUB_OUTPUT"
+
       - name: Upload Video to GitHub Releases
+        if: ${{ hashFiles('DouyinLiveRecorder/downloads/**/*.mp4', 'DouyinLiveRecorder/downloads/**/*.ts', 'DouyinLiveRecorder/downloads/**/*.flv') != '' }}
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: "Stream_${{ env.date }}"
-          name: "Live Stream - ${{ env.date }}"
+          tag_name: "Stream_${{ steps.date.outputs.date }}"
+          name: "Live Stream - ${{ steps.date.outputs.date }}"
           files: DouyinLiveRecorder/downloads/**/*.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
